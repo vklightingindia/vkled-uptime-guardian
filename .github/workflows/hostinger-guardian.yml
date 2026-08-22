@@ -12,7 +12,7 @@ on:
         type: boolean
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: vkled-hostinger-uptime-guardian
@@ -24,6 +24,27 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
+      - name: Keep the public guardian schedule active
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          last_activity="$(gh api repos/${GITHUB_REPOSITORY}/commits --jq '.[0].commit.committer.date')"
+          last_epoch="$(date -d "$last_activity" +%s)"
+          now_epoch="$(date +%s)"
+          if test "$((now_epoch - last_epoch))" -lt 2592000; then
+            echo "Guardian repository activity is newer than 30 days."
+            exit 0
+          fi
+          default_branch="$(gh api repos/${GITHUB_REPOSITORY} --jq '.default_branch')"
+          head_sha="$(gh api repos/${GITHUB_REPOSITORY}/git/ref/heads/${default_branch} --jq '.object.sha')"
+          tree_sha="$(gh api repos/${GITHUB_REPOSITORY}/git/commits/${head_sha} --jq '.tree.sha')"
+          commit_sha="$(gh api --method POST repos/${GITHUB_REPOSITORY}/git/commits \
+            -f message='chore(guardian): keep scheduled continuity active [skip ci]' \
+            -f tree="$tree_sha" -F parents[]="$head_sha" --jq '.sha')"
+          gh api --method PATCH repos/${GITHUB_REPOSITORY}/git/refs/heads/${default_branch} -f sha="$commit_sha" >/dev/null
+          echo "Created a no-content monthly activity commit so GitHub does not disable the public schedule after 60 inactive days."
+
       - name: Probe production readiness
         id: probe
         env:
