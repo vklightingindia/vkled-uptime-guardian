@@ -38,10 +38,12 @@ jobs:
           healthy=false
           for attempt in 1 2 3 4; do
             response_file="$(mktemp)"
+            probe_nonce="$(date +%s)-$attempt"
             http_status="$(curl --silent --show-error \
+              --header 'Cache-Control: no-cache' \
               --connect-timeout 12 --max-time 25 \
               --output "$response_file" --write-out '%{http_code}' \
-              https://one.vkled.in/api/health || true)"
+              "https://one.vkled.in/api/health?guardian=$probe_nonce" || true)"
             response="$(cat "$response_file")"
             if test "$http_status" = "200" && printf '%s' "$response" | jq -e \
               '.ok == true and .database == "connected" and .schema == "ready"' >/dev/null; then
@@ -98,12 +100,16 @@ jobs:
         env:
           EXPECTED_REVISION: ${{ steps.redeploy.outputs.revision }}
         run: |
+          test -n "$EXPECTED_REVISION"
+          printf 'Waiting for production revision %s.\n' "$EXPECTED_REVISION"
           for attempt in $(seq 1 30); do
             response_file="$(mktemp)"
+            probe_nonce="$(date +%s)-$attempt"
             http_status="$(curl --silent --show-error \
+              --header 'Cache-Control: no-cache' \
               --connect-timeout 12 --max-time 25 \
               --output "$response_file" --write-out '%{http_code}' \
-              https://one.vkled.in/api/health || true)"
+              "https://one.vkled.in/api/health?guardian=$probe_nonce" || true)"
             response="$(cat "$response_file")"
             printf 'Recovery verification %s/30 (HTTP %s).\n' "$attempt" "${http_status:-none}"
             if test "$http_status" = "200" && printf '%s' "$response" | jq -e \
@@ -113,6 +119,10 @@ jobs:
               printf '### Recovery verified\n\nRevision `%s` is live and ready.\n' \
                 "$EXPECTED_REVISION" >> "$GITHUB_STEP_SUMMARY"
               exit 0
+            fi
+            if test "$http_status" = "200"; then
+              printf 'Observed revision: %s\n' \
+                "$(printf '%s' "$response" | jq -r '.buildRevision // "missing"')"
             fi
             sleep 20
           done
