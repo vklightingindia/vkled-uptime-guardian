@@ -1,0 +1,129 @@
+name: VK LED Hostinger uptime guardian
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+    inputs:
+      force_redeploy:
+        description: "Run the recovery path even when production is healthy"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vkled-hostinger-uptime-guardian
+  cancel-in-progress: false
+
+jobs:
+  guard:
+    name: Check and recover production
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Probe production readiness
+        id: probe
+        env:
+          FORCE_REDEPLOY: ${{ inputs.force_redeploy || false }}
+        run: |
+          if test "$FORCE_REDEPLOY" = "true"; then
+            echo "A controlled recovery-path verification was requested."
+            echo "healthy=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          healthy=false
+          for attempt in 1 2 3 4; do
+            response_file="$(mktemp)"
+            http_status="$(curl --silent --show-error \
+              --connect-timeout 12 --max-time 25 \
+              --output "$response_file" --write-out '%{http_code}' \
+              https://one.vkled.in/api/health || true)"
+            response="$(cat "$response_file")"
+            if test "$http_status" = "200" && printf '%s' "$response" | jq -e \
+              '.ok == true and .database == "connected" and .schema == "ready"' >/dev/null; then
+              healthy=true
+              printf 'Production is healthy on probe %s.\n' "$attempt"
+              printf '%s\n' "$response"
+              break
+            fi
+            printf 'Readiness probe %s/4 failed (HTTP %s).\n' "$attempt" "${http_status:-none}"
+            sleep 10
+          done
+          echo "healthy=$healthy" >> "$GITHUB_OUTPUT"
+
+      - name: Install the repository-scoped recovery key
+        if: steps.probe.outputs.healthy != 'true'
+        env:
+          PRIVATE_REPO_DEPLOY_KEY: ${{ secrets.PRIVATE_REPO_DEPLOY_KEY }}
+        run: |
+          test -n "$PRIVATE_REPO_DEPLOY_KEY"
+          install -m 700 -d "$HOME/.ssh"
+          printf '%s\n' "$PRIVATE_REPO_DEPLOY_KEY" > "$HOME/.ssh/id_ed25519"
+          chmod 600 "$HOME/.ssh/id_ed25519"
+          ssh-keyscan -H github.com > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+
+      - name: Trigger a bounded clean Hostinger redeploy
+        if: steps.probe.outputs.healthy != 'true'
+        id: redeploy
+        run: |
+          git clone --depth=1 git@github.com:vklightingindia/vkled-business-os.git private-source
+          cd private-source
+          revision="$(git rev-parse HEAD)"
+          last_subject="$(git log -1 --pretty=%s)"
+          last_epoch="$(git log -1 --pretty=%ct)"
+          now_epoch="$(date +%s)"
+          age_seconds="$((now_epoch - last_epoch))"
+
+          if printf '%s' "$last_subject" | grep -q '^chore(continuity):' && test "$age_seconds" -lt 1200; then
+            echo "A recovery deployment is already inside the 20-minute cooldown."
+            echo "triggered=false" >> "$GITHUB_OUTPUT"
+            echo "revision=$revision" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git config user.name "vkled-uptime-guardian"
+          git config user.email "continuity@vkled.in"
+          git commit --allow-empty -m "chore(continuity): recover Hostinger production [skip ci]"
+          git push origin HEAD:main
+          echo "triggered=true" >> "$GITHUB_OUTPUT"
+          echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Verify recovered production revision
+        if: steps.probe.outputs.healthy != 'true'
+        env:
+          EXPECTED_REVISION: ${{ steps.redeploy.outputs.revision }}
+        run: |
+          for attempt in $(seq 1 30); do
+            response_file="$(mktemp)"
+            http_status="$(curl --silent --show-error \
+              --connect-timeout 12 --max-time 25 \
+              --output "$response_file" --write-out '%{http_code}' \
+              https://one.vkled.in/api/health || true)"
+            response="$(cat "$response_file")"
+            printf 'Recovery verification %s/30 (HTTP %s).\n' "$attempt" "${http_status:-none}"
+            if test "$http_status" = "200" && printf '%s' "$response" | jq -e \
+              --arg revision "$EXPECTED_REVISION" \
+              '.ok == true and .database == "connected" and .schema == "ready" and .buildRevision == $revision' >/dev/null; then
+              printf '%s\n' "$response"
+              printf '### Recovery verified\n\nRevision `%s` is live and ready.\n' \
+                "$EXPECTED_REVISION" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            sleep 20
+          done
+          echo "Recovery deployment did not become ready inside the verification window."
+          exit 1
+
+      - name: Record healthy production
+        if: steps.probe.outputs.healthy == 'true'
+        run: |
+          printf '%s\n' \
+            '### VK LED production is healthy' \
+            '' \
+            'Hostinger, database and schema readiness passed. No deployment was created.' \
+            >> "$GITHUB_STEP_SUMMARY"
